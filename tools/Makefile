@@ -52,6 +52,11 @@ ifeq ($(VIRTIO_GPU), y)
 	CFLAGS += -DENABLE_VIRTIO_GPU
 endif
 
+ifeq ($(ENABLE_URING), y)
+	CFLAGS += -DENABLE_URING
+	LDFLAGS += -luring
+endif
+
 include $(sources:.c=.d)
 
 ifeq ($(DEBUG), y)

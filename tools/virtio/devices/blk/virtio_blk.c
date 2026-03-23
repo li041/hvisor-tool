@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /**
- * Copyright (c) 2025 Syswonder
- *
- * Syswonder Website:
- *      https://www.syswonder.org
- *
- * Authors:
- *      Guowei Li <2401213322@stu.pku.edu.cn>
- */
+ * Copyright (c) 2025 Syswonder
+ *
+ * Syswonder Website:
+ *      https://www.syswonder.org
+ *
+ * Authors:
+ *      Guowei Li <2401213322@stu.pku.edu.cn>
+ */
 #include "virtio_blk.h"
 #include "log.h"
 #include "virtio.h"
@@ -17,6 +17,51 @@
 #include <string.h>
 #include <sys/param.h>
 #include <sys/stat.h>
+
+/* ---- Memory pool for blkp_req ---- */
+
+static int blk_pool_init(BlkDev *dev) {
+    int i;
+    dev->pool_storage = malloc(sizeof(struct blkp_req) * VIRTQUEUE_BLK_MAX_SIZE);
+    if (!dev->pool_storage)
+        return -ENOMEM;
+    SLIST_INIT(&dev->pool_free);
+    for (i = 0; i < VIRTQUEUE_BLK_MAX_SIZE; i++)
+        SLIST_INSERT_HEAD(&dev->pool_free, &dev->pool_storage[i], free_link);
+    return 0;
+}
+
+static void blk_pool_destroy(BlkDev *dev) {
+    free(dev->pool_storage);
+    dev->pool_storage = NULL;
+}
+
+static struct blkp_req *blk_pool_alloc(BlkDev *dev) {
+    struct blkp_req *req;
+    pthread_mutex_lock(&dev->mtx);
+    req = SLIST_FIRST(&dev->pool_free);
+    if (req)
+        SLIST_REMOVE_HEAD(&dev->pool_free, free_link);
+    pthread_mutex_unlock(&dev->mtx);
+    if (!req) {
+        log_warn("blk pool exhausted, falling back to malloc");
+        req = malloc(sizeof(struct blkp_req));
+    }
+    return req;
+}
+
+static void blk_pool_free(BlkDev *dev, struct blkp_req *req) {
+    if (req >= dev->pool_storage &&
+        req < dev->pool_storage + VIRTQUEUE_BLK_MAX_SIZE) {
+        pthread_mutex_lock(&dev->mtx);
+        SLIST_INSERT_HEAD(&dev->pool_free, req, free_link);
+        pthread_mutex_unlock(&dev->mtx);
+    } else {
+        free(req);
+    }
+}
+
+/* ---- Completion helper ---- */
 
 static void complete_block_operation(BlkDev *dev, struct blkp_req *req,
                                      VirtQueue *vq, int err,
@@ -39,8 +84,9 @@ static void complete_block_operation(BlkDev *dev, struct blkp_req *req,
     if (is_empty)
         virtio_inject_irq(vq);
     free(req->iov);
-    free(req);
+    blk_pool_free(dev, req);
 }
+
 // get a blk req from procq
 static int get_breq(BlkDev *dev, struct blkp_req **req) {
     struct blkp_req *elem;
@@ -61,13 +107,6 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
     switch (req->type) {
     case VIRTIO_BLK_T_IN:
         written_len = len = preadv(dev->img_fd, &iov[1], n - 2, req->offset);
-        // log_debug("readv data is ");
-        // for(int i = 1; i < n-1; i++) {
-        //     log_debug("n-1 is %d, iov[i].iov_len is %d", n-1,
-        //     iov[i].iov_len); for (int j = 0; j < iov[i].iov_len; j++)
-        //         printf("%x", *(int*)(iov[i].iov_base + j));
-        //     printf("\n");
-        // }
         log_debug("preadv, len is %d, offset is %d", len, req->offset);
         if (len < 0) {
             log_error("pread failed");
@@ -95,7 +134,123 @@ static void blkproc(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
     complete_block_operation(dev, req, vq, err, written_len);
 }
 
-// Every virtio-blk has a blkproc_thread that is used for reading and writing.
+#ifdef ENABLE_URING
+
+/* ---- io_uring completion reaping ---- */
+
+static void blk_reap_completions(BlkDev *dev, VirtQueue *vq) {
+    struct io_uring_cqe *cqe;
+    unsigned head;
+    unsigned count = 0;
+
+    io_uring_for_each_cqe(&dev->ring, head, cqe) {
+        struct blkp_req *req = (struct blkp_req *)io_uring_cqe_get_data(cqe);
+        uint8_t *vstatus = (uint8_t *)(req->iov[req->iovcnt - 1].iov_base);
+        ssize_t written_len = 0;
+
+        if (cqe->res < 0) {
+            log_error("io_uring cqe error: %s", strerror(-cqe->res));
+            *vstatus = VIRTIO_BLK_S_IOERR;
+        } else {
+            *vstatus = VIRTIO_BLK_S_OK;
+            if (req->type == VIRTIO_BLK_T_IN)
+                written_len = cqe->res;
+        }
+
+        update_used_ring(vq, req->idx, written_len + 1);
+        free(req->iov);
+        blk_pool_free(dev, req);
+        count++;
+    }
+
+    io_uring_cq_advance(&dev->ring, count);
+
+    if (count > 0)
+        virtio_inject_irq(vq);
+}
+
+static void blk_submit_uring(BlkDev *dev, struct blkp_req *req, VirtQueue *vq) {
+    struct io_uring_sqe *sqe;
+
+    sqe = io_uring_get_sqe(&dev->ring);
+    if (!sqe) {
+        /* SQ full: submit pending and reap to free space, then retry */
+        io_uring_submit(&dev->ring);
+        struct io_uring_cqe *cqe;
+        io_uring_wait_cqe(&dev->ring, &cqe);
+        blk_reap_completions(dev, vq);
+        sqe = io_uring_get_sqe(&dev->ring);
+        if (!sqe) {
+            log_error("io_uring SQ still full after reap, falling back to sync");
+            blkproc(dev, req, vq);
+            return;
+        }
+    }
+
+    if (req->type == VIRTIO_BLK_T_IN) {
+        io_uring_prep_readv(sqe, dev->img_fd, &req->iov[1],
+                            req->iovcnt - 2, req->offset);
+    } else {
+        io_uring_prep_writev(sqe, dev->img_fd, &req->iov[1],
+                             req->iovcnt - 2, req->offset);
+    }
+    io_uring_sqe_set_data(sqe, req);
+}
+
+// io_uring worker thread
+static void *blkproc_thread(void *arg) {
+    VirtIODevice *vdev = arg;
+    BlkDev *dev = vdev->dev;
+    struct blkp_req *breq;
+    int submitted;
+
+    pthread_mutex_lock(&dev->mtx);
+
+    for (;;) {
+        submitted = 0;
+
+        while (get_breq(dev, &breq)) {
+            pthread_mutex_unlock(&dev->mtx);
+
+            /* Non-I/O requests: handle synchronously */
+            if (breq->type != VIRTIO_BLK_T_IN &&
+                breq->type != VIRTIO_BLK_T_OUT) {
+                blkproc(dev, breq, vdev->vqs);
+                pthread_mutex_lock(&dev->mtx);
+                continue;
+            }
+
+            blk_submit_uring(dev, breq, vdev->vqs);
+            submitted++;
+            pthread_mutex_lock(&dev->mtx);
+        }
+
+        /* Submit any queued SQEs */
+        if (submitted > 0) {
+            pthread_mutex_unlock(&dev->mtx);
+            io_uring_submit(&dev->ring);
+            /* Wait for at least one completion, then reap all */
+            struct io_uring_cqe *cqe;
+            io_uring_wait_cqe(&dev->ring, &cqe);
+            blk_reap_completions(dev, vdev->vqs);
+            pthread_mutex_lock(&dev->mtx);
+            /* Loop back to check for new arrivals */
+            continue;
+        }
+
+        if (dev->close) {
+            pthread_mutex_unlock(&dev->mtx);
+            break;
+        }
+        pthread_cond_wait(&dev->cond, &dev->mtx);
+    }
+    pthread_exit(NULL);
+    return NULL;
+}
+
+#else /* !ENABLE_URING */
+
+// Synchronous worker thread (original path with pool)
 static void *blkproc_thread(void *arg) {
     VirtIODevice *vdev = arg;
     BlkDev *dev = vdev->dev;
@@ -121,6 +276,8 @@ static void *blkproc_thread(void *arg) {
     return NULL;
 }
 
+#endif /* ENABLE_URING */
+
 // create blk dev.
 BlkDev *init_blk_dev(VirtIODevice *vdev) {
     BlkDev *dev = malloc(sizeof(BlkDev));
@@ -130,10 +287,22 @@ BlkDev *init_blk_dev(VirtIODevice *vdev) {
     dev->config.seg_max = BLK_SEG_MAX;
     dev->img_fd = -1;
     dev->close = 0;
-    // TODO: chang to thread poll
     pthread_mutex_init(&dev->mtx, NULL);
     pthread_cond_init(&dev->cond, NULL);
     TAILQ_INIT(&dev->procq);
+    if (blk_pool_init(dev) != 0) {
+        log_error("failed to init blk pool");
+        free(dev);
+        return NULL;
+    }
+#ifdef ENABLE_URING
+    if (io_uring_queue_init(VIRTQUEUE_BLK_MAX_SIZE, &dev->ring, 0) < 0) {
+        log_error("failed to init io_uring");
+        blk_pool_destroy(dev);
+        free(dev);
+        return NULL;
+    }
+#endif
     pthread_create(&dev->tid, NULL, blkproc_thread, vdev);
     return dev;
 }
@@ -164,14 +333,17 @@ int virtio_blk_init(VirtIODevice *vdev, const char *img_path) {
 }
 
 // handle one descriptor list
-static struct blkp_req *virtq_blk_handle_one_request(VirtQueue *vq) {
+static struct blkp_req *virtq_blk_handle_one_request(BlkDev *dev,
+                                                      VirtQueue *vq) {
     log_debug("virtq_blk_handle_one_request enter");
     struct blkp_req *breq;
     struct iovec *iov = NULL;
     uint16_t *flags;
     int i, n;
     BlkReqHead *hdr;
-    breq = malloc(sizeof(struct blkp_req));
+    breq = blk_pool_alloc(dev);
+    if (!breq)
+        return NULL;
     n = process_descriptor_chain(vq, &breq->idx, &iov, &flags, 0, true);
     breq->iov = iov;
     if (n < 2 || n > BLK_SEG_MAX + 2) {
@@ -216,7 +388,7 @@ static struct blkp_req *virtq_blk_handle_one_request(VirtQueue *vq) {
 err_out:
     free(flags);
     free(iov);
-    free(breq);
+    blk_pool_free(dev, breq);
     return NULL;
 }
 
@@ -229,8 +401,9 @@ int virtio_blk_notify_handler(VirtIODevice *vdev, VirtQueue *vq) {
     while (!virtqueue_is_empty(vq)) {
         virtqueue_disable_notify(vq);
         while (!virtqueue_is_empty(vq)) {
-            breq = virtq_blk_handle_one_request(vq);
-            TAILQ_INSERT_TAIL(&procq, breq, link);
+            breq = virtq_blk_handle_one_request(blkDev, vq);
+            if (breq)
+                TAILQ_INSERT_TAIL(&procq, breq, link);
         }
         virtqueue_enable_notify(vq);
     }
@@ -255,6 +428,10 @@ void virtio_blk_close(VirtIODevice *vdev) {
     pthread_mutex_destroy(&dev->mtx);
     pthread_cond_destroy(&dev->cond);
     close(dev->img_fd);
+#ifdef ENABLE_URING
+    io_uring_queue_exit(&dev->ring);
+#endif
+    blk_pool_destroy(dev);
     free(dev);
     free(vdev->vqs);
     free(vdev);
