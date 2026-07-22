@@ -25,12 +25,13 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 #include <linux/wait.h>
 
 #include "hvisor.h"
 #include "ivc.h"
 
-#ifdef ARM64
+#if defined(ARM64) || defined(LOONGARCH64)
 
 struct ivc_info {
     __u64 len;
@@ -50,7 +51,9 @@ struct ivc_dev {
     int idx;
     int ivc_id;
     int ivc_irq;
-    int received_irq; // receive irq count
+    atomic_t received_irq;
+    bool cdev_added;
+    bool device_created;
 };
 
 ivc_info_t *ivc_info;
@@ -85,12 +88,14 @@ static int ivc_open(struct inode *inode, struct file *file) {
 }
 
 static int hvisor_user_ivc_info(ivc_uinfo_t __user *uinfo) {
+    ivc_uinfo_t info = {0};
     int i;
-    uinfo->len = ivc_info->len;
+
+    info.len = ivc_info->len;
     for (i = 0; i < ivc_info->len; i++) {
-        uinfo->ivc_ids[i] = ivc_info->ivc_ids[i];
+        info.ivc_ids[i] = ivc_info->ivc_ids[i];
     }
-    return 0;
+    return copy_to_user(uinfo, &info, sizeof(info)) ? -EFAULT : 0;
 }
 
 static long ivc_ioctl(struct file *file, unsigned int ioctl,
@@ -114,6 +119,7 @@ static int ivc_map(struct file *filp, struct vm_area_struct *vma) {
     struct ivc_dev *dev = filp->private_data;
     idx = dev->idx;
     phys = vma->vm_pgoff << PAGE_SHIFT;
+    vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_IO);
 
     if (phys == 0) {
         // control table
@@ -144,9 +150,8 @@ static unsigned int ivc_poll(struct file *filp,
     __poll_t mask = 0;
     struct ivc_dev *this_dev = (struct ivc_dev *)filp->private_data;
     poll_wait(filp, &this_dev->wq, wait);
-    if (this_dev->received_irq) {
+    if (atomic_xchg(&this_dev->received_irq, 0)) {
         mask |= POLLIN;
-        this_dev->received_irq = 0;
     }
     return mask;
 }
@@ -161,15 +166,19 @@ static const struct file_operations ivc_fops = {
 };
 
 static irqreturn_t ivc_irq_handler(int irq, void *dev_id) {
-    int i;
-    struct ivc_dev *this_dev = NULL;
-    for (i = 0; i < dev_len; i++)
-        if (dev_id == &ivc_devs[i])
-            this_dev = (struct ivc_dev *)dev_id;
-    if (!this_dev)
+    struct ivc_dev *this_dev = dev_id;
+
+    if (!this_dev || this_dev < ivc_devs || this_dev >= ivc_devs + dev_len)
         return IRQ_NONE;
-    this_dev->received_irq++;
+    atomic_inc(&this_dev->received_irq);
     wake_up(&this_dev->wq);
+#ifdef LOONGARCH64
+    if ((__s64)hvisor_call(HVISOR_HC_CLEAR_INJECT_IRQ, ~0ULL,
+                           ivc_info->ivc_irqs[this_dev->idx]) < 0)
+        pr_err_ratelimited("ivc: failed to deassert channel %d IRQ %u\n",
+                           this_dev->idx,
+                           ivc_info->ivc_irqs[this_dev->idx]);
+#endif
     return IRQ_HANDLED;
 }
 
@@ -177,8 +186,11 @@ static int __init ivc_init(void) {
     int err, i, soft_irq;
     struct device_node *node = NULL;
     err = hvisor_ivc_info();
-    if (err)
+    if (err) {
+        kfree(ivc_info);
+        ivc_info = NULL;
         return err;
+    }
     dev_len = ivc_info->len;
 
     pr_info("ivc: hypervisor reports %d channel(s)\n", dev_len);
@@ -192,10 +204,15 @@ static int __init ivc_init(void) {
         goto err1;
     pr_info("ivc get major id: %d\n", MAJOR(mdev_id));
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    ivc_class = class_create("hivc");
+#else
     ivc_class = class_create(THIS_MODULE, "hivc");
+#endif
     if (IS_ERR(ivc_class)) {
         err = PTR_ERR(ivc_class);
-        goto err1;
+        ivc_class = NULL;
+        goto err2;
     }
 
     for (i = 0; i < dev_len; i++) {
@@ -204,61 +221,71 @@ static int __init ivc_init(void) {
         ivc_devs[i].idx = i;
         ivc_devs[i].ivc_irq = -1;
         ivc_devs[i].cdev.owner = THIS_MODULE;
-        ivc_devs[i].received_irq = 0;
+        atomic_set(&ivc_devs[i].received_irq, 0);
         init_waitqueue_head(&ivc_devs[i].wq);
         cdev_init(&ivc_devs[i].cdev, &ivc_fops);
         err = cdev_add(&ivc_devs[i].cdev, ivc_devs[i].dev_id, 1);
         if (err)
             goto err2;
+        ivc_devs[i].cdev_added = true;
         ivc_devs[i].device = device_create(ivc_class, NULL, ivc_devs[i].dev_id,
                                            NULL, "hivc%d", ivc_devs[i].ivc_id);
         if (IS_ERR(ivc_devs[i].device)) {
             err = PTR_ERR(ivc_devs[i].device);
+            ivc_devs[i].device = NULL;
             goto err2;
         }
+        ivc_devs[i].device_created = true;
     }
     node = of_find_node_by_path("/hvisor_ivc_device");
     if (!node) {
-        // add_ivc_device_node();
-        pr_info("hvisor_ivc_device node not found in dtb, can't use ivc\n");
-    } else {
-        for (i = 0; i < dev_len; i++) {
-            soft_irq = of_irq_get(node, i);
-            if (soft_irq < 0) {
-                pr_err("ivc: of_irq_get channel %d failed (%d)\n", i, soft_irq);
-                continue;
-            }
-            err = request_irq(soft_irq, ivc_irq_handler,
-                              IRQF_SHARED | IRQF_TRIGGER_RISING,
-                              "hvisor_ivc_device", &ivc_devs[i]);
-            if (err) {
-                pr_err("ivc: request irq channel %d failed (%d)\n", i, err);
-                goto err2;
-            }
-            ivc_devs[i].ivc_irq = soft_irq;
-            pr_info("ivc: ch%d id=%d linux_irq=%d hv_irq=%u\n", i,
-                    ivc_devs[i].ivc_id, soft_irq, ivc_info->ivc_irqs[i]);
+        pr_err("ivc: /hvisor_ivc_device is missing from the device tree\n");
+        err = -ENODEV;
+        goto err2;
+    }
+    for (i = 0; i < dev_len; i++) {
+        soft_irq = of_irq_get(node, i);
+        if (soft_irq < 0) {
+            pr_err("ivc: of_irq_get channel %d failed (%d)\n", i, soft_irq);
+            err = soft_irq;
+            goto err2;
         }
+        err = request_irq(soft_irq, ivc_irq_handler,
+                          IRQF_SHARED | IRQF_TRIGGER_RISING,
+                          "hvisor_ivc_device", &ivc_devs[i]);
+        if (err) {
+            pr_err("ivc: request irq channel %d failed (%d)\n", i, err);
+            goto err2;
+        }
+        ivc_devs[i].ivc_irq = soft_irq;
+        pr_info("ivc: ch%d id=%d linux_irq=%d hv_irq=%u\n", i,
+                ivc_devs[i].ivc_id, soft_irq, ivc_info->ivc_irqs[i]);
     }
     of_node_put(node);
     pr_info("ivc init!!!\n");
     return 0;
 
 err2:
+    of_node_put(node);
     for (i = 0; i < dev_len; i++) {
         if (ivc_devs[i].ivc_irq >= 0) {
             free_irq(ivc_devs[i].ivc_irq, &ivc_devs[i]);
             ivc_devs[i].ivc_irq = -1;
         }
-        cdev_del(&ivc_devs[i].cdev);
-        if (ivc_class && !IS_ERR(ivc_class))
+        if (ivc_devs[i].device_created)
             device_destroy(ivc_class, ivc_devs[i].dev_id);
+        if (ivc_devs[i].cdev_added)
+            cdev_del(&ivc_devs[i].cdev);
     }
-    class_destroy(ivc_class);
+    if (ivc_class)
+        class_destroy(ivc_class);
     unregister_chrdev_region(mdev_id, dev_len);
 err1:
     kfree(ivc_info);
     kfree(ivc_devs);
+    ivc_info = NULL;
+    ivc_devs = NULL;
+    dev_len = 0;
     return err;
 }
 
@@ -282,15 +309,14 @@ static void __exit ivc_exit(void) {
     /* 销毁字符设备、sysfs 设备节点 */
     if (ivc_class && !IS_ERR(ivc_class)) {
         for (i = 0; i < dev_len; i++) {
-            cdev_del(&ivc_devs[i].cdev);
-            device_destroy(ivc_class, ivc_devs[i].dev_id);
+            if (ivc_devs[i].device_created)
+                device_destroy(ivc_class, ivc_devs[i].dev_id);
+            if (ivc_devs[i].cdev_added)
+                cdev_del(&ivc_devs[i].cdev);
         }
         class_destroy(ivc_class);
     }
     unregister_chrdev_region(mdev_id, dev_len);
-
-    for (i = 0; i < dev_len; i++) {
-    }
 
     kfree(ivc_devs);
     ivc_devs = NULL;

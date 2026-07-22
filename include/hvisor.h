@@ -227,7 +227,10 @@ static inline __u64 hvisor_call(__u64 code, __u64 arg0, __u64 arg1) {
     register __u64 a2 asm("a2") = arg1;
     // asm volatile ("hvcl"); // not supported by loongarch gcc now
     // hvcl 0 is 0x002b8000
-    __asm__(".word 0x002b8000" : "+r"(a0), "+r"(a1), "+r"(a2));
+    asm volatile(".word 0x002b8000"
+                 : "+r"(a0), "+r"(a1), "+r"(a2)
+                 :
+                 : "memory");
     return a0;
 }
 #endif /* LOONGARCH64 */
