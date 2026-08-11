@@ -34,6 +34,25 @@ static ConsoleDev *init_console_dev() {
     return dev;
 }
 
+static int virtio_console_update_rx_event(ConsoleDev *dev, VirtQueue *vq) {
+    if (!virtqueue_is_empty(vq)) {
+        virtqueue_disable_notify(vq);
+        return rearm_event(dev->event);
+    }
+
+    // Hand wakeup ownership back to the guest while no RX buffer is available.
+    // Re-check after publishing the notification change so a descriptor posted
+    // while notifications were suppressed cannot be missed.
+    virtqueue_enable_notify(vq);
+    rw_barrier();
+    if (virtqueue_is_empty(vq)) {
+        return 0;
+    }
+
+    virtqueue_disable_notify(vq);
+    return rearm_event(dev->event);
+}
+
 static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     // log_debug("%s", __func__);
     VirtIODevice *vdev = (VirtIODevice *)param;
@@ -44,7 +63,6 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     struct iovec *iov = NULL;
     uint16_t idx;
     bool used_buffer = false;
-    bool descriptor_error = false;
 
     if (fd != dev->master_fd || !(epoll_type & EPOLLIN)) {
         log_error("Invalid console event");
@@ -70,6 +88,9 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     }
     if (virtqueue_is_empty(vq)) {
         log_debug("console RX paused until the guest posts a receive buffer");
+        if (virtio_console_update_rx_event(dev, vq) < 0) {
+            log_error("failed to update console RX event");
+        }
         pthread_mutex_unlock(&dev->rx_lock);
         return;
     }
@@ -78,7 +99,6 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
         n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
         if (n < 1) {
             log_error("process_descriptor_chain failed");
-            descriptor_error = true;
             break;
         }
         len = readv(dev->master_fd, iov, n);
@@ -98,9 +118,8 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
         free(iov);
     }
 
-    if (!descriptor_error && !virtqueue_is_empty(vq) &&
-        rearm_event(dev->event) < 0) {
-        log_error("failed to rearm console RX event");
+    if (virtio_console_update_rx_event(dev, vq) < 0) {
+        log_error("failed to update console RX event");
     }
     pthread_mutex_unlock(&dev->rx_lock);
 
@@ -173,10 +192,9 @@ static int virtio_console_rxq_notify_handler(VirtIODevice *vdev,
     pthread_mutex_lock(&dev->rx_lock);
     if (dev->rx_ready <= 0) {
         dev->rx_ready = 1;
-        virtqueue_disable_notify(vq);
     }
-    if (!virtqueue_is_empty(vq) && rearm_event(dev->event) < 0) {
-        log_error("failed to resume console RX event");
+    if (virtio_console_update_rx_event(dev, vq) < 0) {
+        log_error("failed to update console RX event");
     }
     pthread_mutex_unlock(&dev->rx_lock);
     return 0;
@@ -198,6 +216,8 @@ static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
         return;
     }
 
+    // TODO: Keep the descriptor and write offset on EAGAIN or a partial write,
+    // arm EPOLLOUT, and only update the used ring after all bytes are written.
     len = writev(dev->master_fd, iov, n);
     if (len < 0) {
         log_error("Failed to write to console, errno is %d", errno);
