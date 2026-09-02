@@ -79,6 +79,10 @@ struct hvisor_event *add_event(int fd, int epoll_type,
 }
 
 int rearm_event(struct hvisor_event *event) {
+    return update_event(event, event ? event->epoll_type : 0);
+}
+
+int update_event(struct hvisor_event *event, int epoll_type) {
     struct epoll_event eevent;
 
     if (event == NULL || event->fd < 0) {
@@ -86,7 +90,8 @@ int rearm_event(struct hvisor_event *event) {
         return -1;
     }
 
-    eevent.events = event->epoll_type;
+    event->epoll_type = epoll_type;
+    eevent.events = epoll_type;
     eevent.data.ptr = event;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, event->fd, &eevent) < 0) {
         log_error("failed to rearm fd %d, errno is %d", event->fd, errno);

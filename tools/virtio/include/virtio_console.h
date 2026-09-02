@@ -22,6 +22,14 @@
 #define CONSOLE_QUEUE_TX 1
 
 typedef struct virtio_console_config ConsoleConfig;
+typedef struct virtio_console_tx_pending {
+    uint16_t idx;
+    uint8_t *data;
+    size_t len;
+    size_t off;
+    struct virtio_console_tx_pending *next;
+} ConsoleTxPending;
+
 typedef struct virtio_console_dev {
     ConsoleConfig config;
     int master_fd;
@@ -29,6 +37,11 @@ typedef struct virtio_console_dev {
     int rx_ready;
     struct hvisor_event *event;
     pthread_mutex_t rx_lock;
+    pthread_mutex_t tx_lock;
+    pthread_mutex_t event_lock;
+    ConsoleTxPending *tx_head;
+    ConsoleTxPending *tx_tail;
+    bool tx_pending;
 } ConsoleDev;
 
 extern const struct virtio_device_ops virtio_console_ops;

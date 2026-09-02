@@ -21,6 +21,9 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <termios.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/epoll.h>
 
 static ConsoleDev *init_console_dev() {
     ConsoleDev *dev = (ConsoleDev *)malloc(sizeof(ConsoleDev));
@@ -31,13 +34,28 @@ static ConsoleDev *init_console_dev() {
     dev->rx_ready = -1;
     dev->event = NULL;
     pthread_mutex_init(&dev->rx_lock, NULL);
+    pthread_mutex_init(&dev->tx_lock, NULL);
+    pthread_mutex_init(&dev->event_lock, NULL);
+    dev->tx_head = NULL;
+    dev->tx_tail = NULL;
+    dev->tx_pending = false;
     return dev;
+}
+
+static int virtio_console_rearm_event(ConsoleDev *dev) {
+    int events = EPOLLIN | EPOLLONESHOT;
+    if (__atomic_load_n(&dev->tx_pending, __ATOMIC_ACQUIRE))
+        events |= EPOLLOUT;
+    pthread_mutex_lock(&dev->event_lock);
+    int ret = update_event(dev->event, events);
+    pthread_mutex_unlock(&dev->event_lock);
+    return ret;
 }
 
 static int virtio_console_update_rx_event(ConsoleDev *dev, VirtQueue *vq) {
     if (!virtqueue_is_empty(vq)) {
         virtqueue_disable_notify(vq);
-        return rearm_event(dev->event);
+        return virtio_console_rearm_event(dev);
     }
 
     // Hand wakeup ownership back to the guest while no RX buffer is available.
@@ -50,7 +68,61 @@ static int virtio_console_update_rx_event(ConsoleDev *dev, VirtQueue *vq) {
     }
 
     virtqueue_disable_notify(vq);
-    return rearm_event(dev->event);
+    return virtio_console_rearm_event(dev);
+}
+
+static bool virtio_console_queue_tx(ConsoleDev *dev, VirtQueue *vq, uint16_t idx,
+                                    uint8_t *data, size_t len, size_t off) {
+    ConsoleTxPending *pending = calloc(1, sizeof(*pending));
+    if (!pending) {
+        log_error("failed to allocate console TX pending buffer");
+        update_used_ring(vq, idx, 0);
+        free(data);
+        return false;
+    }
+    pending->idx = idx;
+    pending->data = data;
+    pending->len = len;
+    pending->off = off;
+    if (dev->tx_tail)
+        dev->tx_tail->next = pending;
+    else
+        dev->tx_head = pending;
+    dev->tx_tail = pending;
+    __atomic_store_n(&dev->tx_pending, true, __ATOMIC_RELEASE);
+    return true;
+}
+
+static bool virtio_console_flush_tx(ConsoleDev *dev, VirtQueue *vq) {
+    bool used_buffer = false;
+    while (dev->tx_head) {
+        ConsoleTxPending *pending = dev->tx_head;
+        while (pending->off < pending->len) {
+            ssize_t written = write(dev->master_fd, pending->data + pending->off,
+                                    pending->len - pending->off);
+            if (written > 0) {
+                pending->off += (size_t)written;
+                continue;
+            }
+            if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                __atomic_store_n(&dev->tx_pending, true, __ATOMIC_RELEASE);
+                return used_buffer;
+            }
+            log_error("failed to write console TX data, errno is %d", errno);
+            pending->off = pending->len;
+            break;
+        }
+
+        update_used_ring(vq, pending->idx, (uint32_t)pending->len);
+        used_buffer = true;
+        dev->tx_head = pending->next;
+        if (!dev->tx_head)
+            dev->tx_tail = NULL;
+        free(pending->data);
+        free(pending);
+    }
+    __atomic_store_n(&dev->tx_pending, false, __ATOMIC_RELEASE);
+    return used_buffer;
 }
 
 static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
@@ -62,9 +134,7 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     ssize_t len;
     struct iovec *iov = NULL;
     uint16_t idx;
-    bool used_buffer = false;
-
-    if (fd != dev->master_fd || !(epoll_type & EPOLLIN)) {
+    if (fd != dev->master_fd || !(epoll_type & (EPOLLIN | EPOLLOUT))) {
         log_error("Invalid console event");
         return;
     }
@@ -73,16 +143,30 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
         return;
     }
 
+    bool tx_used_buffer = false;
+    if ((epoll_type & EPOLLOUT) ||
+        __atomic_load_n(&dev->tx_pending, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_lock(&dev->tx_lock);
+        tx_used_buffer =
+            virtio_console_flush_tx(dev, &vdev->vqs[CONSOLE_QUEUE_TX]);
+        pthread_mutex_unlock(&dev->tx_lock);
+        if (tx_used_buffer)
+            virtio_inject_irq(&vdev->vqs[CONSOLE_QUEUE_TX]);
+    }
+
+    bool rx_used_buffer = false;
     pthread_mutex_lock(&dev->rx_lock);
     if (dev->rx_ready <= 0) {
         log_debug(
             "console RX paused until the guest enables its receive queue");
+        virtio_console_rearm_event(dev);
         pthread_mutex_unlock(&dev->rx_lock);
         return;
     }
     if (vq->used_ring == NULL || vq->avail_ring == NULL) {
         log_debug(
             "console RX paused until the guest configures its receive queue");
+        virtio_console_rearm_event(dev);
         pthread_mutex_unlock(&dev->rx_lock);
         return;
     }
@@ -114,7 +198,7 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
             break;
         }
         update_used_ring(vq, idx, len);
-        used_buffer = true;
+        rx_used_buffer = true;
         free(iov);
     }
 
@@ -123,7 +207,7 @@ static void virtio_console_event_handler(int fd, int epoll_type, void *param) {
     }
     pthread_mutex_unlock(&dev->rx_lock);
 
-    if (used_buffer) {
+    if (rx_used_buffer) {
         virtio_inject_irq(vq);
     }
     return;
@@ -200,43 +284,78 @@ static int virtio_console_rxq_notify_handler(VirtIODevice *vdev,
     return 0;
 }
 
-static void virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
+static bool virtq_tx_handle_one_request(ConsoleDev *dev, VirtQueue *vq) {
     int n;
     uint16_t idx;
     ssize_t len;
     struct iovec *iov = NULL;
     if (dev->master_fd <= 0) {
         log_error("Console master fd is not ready");
-        return;
+        return false;
     }
 
     n = process_descriptor_chain(vq, &idx, &iov, NULL, 0, false);
 
     if (n < 1) {
-        return;
+        return false;
     }
 
-    // TODO: Keep the descriptor and write offset on EAGAIN or a partial write,
-    // arm EPOLLOUT, and only update the used ring after all bytes are written.
-    len = writev(dev->master_fd, iov, n);
-    if (len < 0) {
-        log_error("Failed to write to console, errno is %d", errno);
+    size_t total = 0;
+    for (int i = 0; i < n; i++)
+        total += iov[i].iov_len;
+    uint8_t *data = malloc(total ? total : 1);
+    if (!data) {
+        free(iov);
+        return false;
     }
-    update_used_ring(vq, idx, 0);
+    size_t copied = 0;
+    for (int i = 0; i < n; i++) {
+        memcpy(data + copied, iov[i].iov_base, iov[i].iov_len);
+        copied += iov[i].iov_len;
+    }
+    size_t off = 0;
+    while (off < total) {
+        len = write(dev->master_fd, data + off, total - off);
+        if (len > 0) {
+            off += (size_t)len;
+            continue;
+        }
+        if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (!virtio_console_queue_tx(dev, vq, idx, data, total, off))
+                return false;
+            free(iov);
+            return true;
+        }
+        log_error("Failed to write to console, errno is %d", errno);
+        off = total;
+    }
+    update_used_ring(vq, idx, (uint32_t)total);
+    free(data);
     free(iov);
+    return false;
 }
 
 static int virtio_console_txq_notify_handler(VirtIODevice *vdev,
                                              VirtQueue *vq) {
     log_debug("%s", __func__);
-    while (!virtqueue_is_empty(vq)) {
+    bool used_buffer = false;
+    ConsoleDev *dev = (ConsoleDev *)vdev->dev;
+    pthread_mutex_lock(&dev->tx_lock);
+    used_buffer |= virtio_console_flush_tx(dev, vq);
+    while (!dev->tx_pending && !virtqueue_is_empty(vq)) {
         virtqueue_disable_notify(vq);
         while (!virtqueue_is_empty(vq)) {
-            virtq_tx_handle_one_request(vdev->dev, vq);
+            if (virtq_tx_handle_one_request(dev, vq))
+                break;
+            used_buffer = true;
         }
         virtqueue_enable_notify(vq);
     }
-    virtio_inject_irq(vq);
+    if (virtio_console_rearm_event(dev) < 0)
+        log_error("failed to rearm console TX event");
+    pthread_mutex_unlock(&dev->tx_lock);
+    if (used_buffer)
+        virtio_inject_irq(vq);
     return 0;
 }
 
@@ -248,6 +367,13 @@ static void virtio_console_close(VirtIODevice *vdev) {
 
     ConsoleDev *dev = vdev->dev;
     if (dev) {
+        ConsoleTxPending *pending = dev->tx_head;
+        while (pending) {
+            ConsoleTxPending *next = pending->next;
+            free(pending->data);
+            free(pending);
+            pending = next;
+        }
         if (dev->master_fd >= 0)
             close(dev->master_fd);
         if (dev->slave_keepalive_fd >= 0)
@@ -255,6 +381,8 @@ static void virtio_console_close(VirtIODevice *vdev) {
         remove_event(dev->event);
         free(dev->event);
         pthread_mutex_destroy(&dev->rx_lock);
+        pthread_mutex_destroy(&dev->tx_lock);
+        pthread_mutex_destroy(&dev->event_lock);
         free(dev);
         vdev->dev = NULL;
     }

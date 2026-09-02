@@ -25,4 +25,5 @@ struct hvisor_event *add_event(int fd, int epoll_type,
                                void (*handler)(int, int, void *), void *param);
 void remove_event(struct hvisor_event *hevent);
 int rearm_event(struct hvisor_event *event);
+int update_event(struct hvisor_event *event, int epoll_type);
 #endif // HVISOR_EVENT_H
